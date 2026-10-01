@@ -87,7 +87,9 @@ MCode 在每個 lifecycle 事件觸發時，會 spawn 這個 plugin 的 bridge s
 2. 否則查 `state.json` 的 `session_id → pane_id` 快取
 3. 否則 `herdr pane list`，挑 `cwd` 與本 session 相符且**恰好一個**的 pane
 
-比對必須唯一，否則一律 no-op——回報錯 pane 會跟別的 agent 搶狀態權。已被其他 agent 持有的 pane 不會被搶占。結果會快取，每個 session 只探測一次。
+比對必須唯一，否則一律 no-op——回報錯 pane 會跟別的 agent 搶狀態權。已被其他 agent 持有的 pane 不會被搶占。結果會快取，每個 session 只在 `SessionStart` 探測一次。
+
+pane id 會被 herdr 回收，所以快取不能無限期信任：`SessionEnd` 會連帶移除該 session 的快取項，而 `SessionStart` 會重新探測一次，讓被還原到新 pane 的 session 找回正確位置（探測歧義時則保留原快取）。細節見[設計文件](../docs/herdr-bridge-design.md)。
 
 `--seq` 刻意是**跨 pane 共用的單一計數器**，且首次啟動以 `Date.now()` 起算而非 0：herdr 記憶的「最後接受 seq」與 `state.json` 無關，從 1 開始會在 plugin data 被清除後被整批靜默丟棄。
 
@@ -103,13 +105,14 @@ node --test tests/herdr-bridge.test.mjs
 
 測試不需要 herdr 安裝；以 Node.js 產生 fake herdr CLI（fake-herdr.cmd + fake-herdr.mjs）攔截 `pane report-agent` 的 argv 並寫入 log，斷言 hook payload 對應到正確的 herdr CLI 參數。fake herdr 同時能應答 `pane list`，用來測試 pane 反查。
 
-涵蓋範圍（33 個測試）：
+涵蓋範圍（37 個測試）：
 - 每個 MCode event 對應的 herdr state 與 message
 - SessionStart 的 `--agent-session-id` 與 resume argv 形狀
 - resume argv 驗證：session id 含撇號或控制字元時降級為僅回報狀態
 - `--seq` 單調遞增 + 持久化往返 + 損壞容錯 + 首次以 timestamp 起算
 - `state.json` 原子寫入（不留下 `.tmp` 殘留檔）
 - Pane 反查：cwd 唯一匹配、歧義 no-op、子目錄 fallback、不搶他人持有的 pane、快取不重複探測
+- 快取失效：`SessionEnd` 清除快取項、還原到新 pane 的 session 重新解析、探測無定論時保留快取、存活 session 不被重新指向
 - HERDR_ENV gating（脫離 herdr 時 no-op）
 - stdin 損壞 / 空 / 非 JSON / 未知 event 名稱時 graceful no-op
 
@@ -120,6 +123,7 @@ node --test tests/herdr-bridge.test.mjs
 - MCode 的 `PermissionRequest` / `PreToolUse` 等事件只有在啟用對應 hook 設定時才會觸發；本 plugin 預設全部註冊
 - **同一 workspace 開兩個 pane 跑同一目錄時 pane 反查會歧義 → no-op**。此時 sidebar 不會顯示 mcode，是刻意的安全降級
 - 普通終端機（非 herdr pane）裡的 MCode 若 cwd 恰好對應到一個空閒 herdr pane，仍會認領它；`SessionEnd` 會釋放
+- `SessionEnd` 沒觸發時（process 被強制結束），該 session 的快取項會留到它下次被還原為止；此時 `SessionStart` 的重新探測會自行修正指向
 - herdr 對外顯示的狀態可能是 `done` 而非 `idle`：bridge 送的是 `idle`，herdr 在偵測到一輪結束時自行衍生為 `done`。這正是 `herdr agent wait --until done` 所等待的狀態
 
 ## 參考資料

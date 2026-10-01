@@ -367,15 +367,42 @@ function listPanes(herdrBin, childEnv) {
  * Returns `{ paneId, cache, cacheChanged }`, or `undefined` when no pane can be
  * identified with confidence.
  */
-function resolvePane({ env, herdrBin, sessionId, sessionCwd, panes }) {
+function resolvePane({ env, herdrBin, sessionId, sessionCwd, panes, isSessionStart = false }) {
   // Fast path: if MCode ever starts passing HERDR_* through, use it and skip
   // the round-trip entirely. Also keeps the test suite's fast path intact.
   if (env.HERDR_ENV === '1' && env.HERDR_PANE_ID) {
     return { paneId: env.HERDR_PANE_ID, cache: panes, cacheChanged: false };
   }
 
-  if (sessionId && panes && typeof panes[sessionId] === 'string') {
-    return { paneId: panes[sessionId], cache: panes, cacheChanged: false };
+  const cached = sessionId && panes && typeof panes[sessionId] === 'string'
+    ? panes[sessionId]
+    : undefined;
+
+  // A cached pane id does not outlive its pane: Herdr recycles ids once a pane
+  // closes, and a session resumed after a restart can land in a different one.
+  // Reporting into a pane that is gone fails with `pane_not_found`, and because
+  // Herdr's failure is swallowed here, a stale entry would silently mute every
+  // later event for that session with no way to recover.
+  //
+  // SessionStart is the one event where that is correctable, because it is
+  // exactly when a resumed session has to find its new home. Re-probe there and
+  // let a fresh answer overwrite the cache. Every other event keeps using the
+  // cache: a live process cannot migrate panes mid-session, so re-probing per
+  // event would only buy the same answer at the cost of a round-trip per
+  // PreToolUse / PostToolUse.
+  if (isSessionStart && sessionCwd) {
+    const fresh = pickPane(listPanes(herdrBin || 'herdr', herdrChildEnv()), sessionCwd);
+    if (fresh) {
+      if (!sessionId) return { paneId: fresh, cache: panes, cacheChanged: false };
+      const nextCache = { ...(panes ?? {}), [sessionId]: fresh };
+      return { paneId: fresh, cache: nextCache, cacheChanged: fresh !== cached };
+    }
+    // An ambiguous or empty probe proves nothing, so keep the cached mapping
+    // rather than discard one that is probably still right.
+  }
+
+  if (cached) {
+    return { paneId: cached, cache: panes, cacheChanged: false };
   }
 
   // Fall back to the binary on PATH; MCode does pass PATH through.
@@ -428,15 +455,22 @@ async function main() {
     sessionId,
     sessionCwd: typeof payload.cwd === 'string' ? payload.cwd : undefined,
     panes: counter.panes,
+    isSessionStart: event === 'SessionStart',
   });
   if (!resolved) {
     return;
   }
 
   counter.seq += 1;
-  persistSequenceState(env, counter.seq, resolved.cache ?? counter.panes);
 
   if (event === 'SessionEnd') {
+    // Drop the mapping as part of letting the pane go. Keeping it would leave a
+    // pane id Herdr is free to recycle, and the next process to resume under this
+    // session id would then report into whatever pane took that id — or into no
+    // pane at all, if none did.
+    const remaining = { ...(resolved.cache ?? counter.panes) };
+    if (sessionId) delete remaining[sessionId];
+    persistSequenceState(env, counter.seq, remaining);
     releaseAgent({
       herdrBin: env.HERDR_BIN_PATH || 'herdr',
       paneId: resolved.paneId,
@@ -445,6 +479,8 @@ async function main() {
     });
     return;
   }
+
+  persistSequenceState(env, counter.seq, resolved.cache ?? counter.panes);
 
   const message = messageFor(payload);
 

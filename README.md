@@ -12,7 +12,7 @@ MCode 在 herdr pane 中執行時，sidebar 會即時顯示 `idle` / `working` /
 | --- | --- |
 | [`herdr-bridge/`](./herdr-bridge/) | MCode plugin 本體（安裝、限制與運作原理見 [其 README](./herdr-bridge/README.md)） |
 | [`docs/herdr-bridge-design.md`](./docs/herdr-bridge-design.md) | 設計文件：hook event → herdr state 對照、pane 反查方案、resume argv 驗證、failure modes |
-| [`tests/herdr-bridge.test.mjs`](./tests/herdr-bridge.test.mjs) | 單元測試（33 項，不需要安裝 herdr） |
+| [`tests/herdr-bridge.test.mjs`](./tests/herdr-bridge.test.mjs) | 單元測試（37 項，不需要安裝 herdr） |
 
 ## 快速開始
 

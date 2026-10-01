@@ -60,7 +60,7 @@ herdr（v0.9.3，2026-09）內建支援 22 個 coding agent CLI（[Agents 文件
 | `Stop` | `idle` | （無） |  | 回合結束 |
 | `PreCompact` | `working` | `compacting` |  | 自動壓縮 |
 | `PostCompact` | `working` | （無） |  | 壓縮完成 |
-| `SessionEnd` | `release-agent` | — |  | 清除 pane 上的 agent 註冊 |
+| `SessionEnd` | `release-agent` | — |  | 清除 pane 上的 agent 註冊，並移除該 session 的 pane 快取項 |
 
 ### 不做的事
 
@@ -125,14 +125,25 @@ herdr 在受管 pane 中注入（見 [herdr add-herdr-support docs](https://herd
 因此改以 `herdr pane list` 反查：
 
 1. 先看 `HERDR_PANE_ID`：若上游未來把 `HERDR_*` 加進白名單，直接採用並跳過所有探測（保留此路徑是刻意的）
-2. 再看 `state.json` 內 `session_id → pane_id` 快取
-3. 最後才 `herdr pane list`，挑出 `cwd` 與本 session `cwd` 相符的 pane
+2. `SessionStart` 時先重新 `herdr pane list` 探測一次（見下方「快取的失效與自癒」）；探測無定論才退回 `state.json` 內 `session_id → pane_id` 快取
+3. 其餘事件直接用 `state.json` 快取
 
 **比對規則刻意嚴格：必須恰好一個相符，否則什麼都不回報。** 回報到錯誤的 pane 會與另一個 agent 爭奪狀態權，比沉默嚴重得多。細節：
 
 - 只考慮**未被其他 agent 持有**的 pane（`agent` 欄位為空或就是 `mcode` 自己）。因為 `HERDR_ENV` gate 已無法使用，普通終端機裡的 MCode 與 pane 內的 MCode 從 bridge 視角無法區分，沒有這道過濾就會去搶同目錄的 herdr pane
 - 完全不相符時，允許退而比對「pane cwd 是 session cwd 的祖先」（session 在 pane 目錄的子目錄啟動），同樣要求唯一
-- 結果寫入 `state.json` 快取，因此每個 session 只探測一次，`PreToolUse` / `PostToolUse` 這類高頻事件不會每次都 spawn
+- 結果寫入 `state.json` 快取，因此每個 session 只在 `SessionStart` 探測一次，`PreToolUse` / `PostToolUse` 這類高頻事件不會每次都 spawn
+
+### 快取的失效與自癒
+
+pane id 不是永久有效的：pane 關閉後 herdr 會回收 id，而被還原的 session 也可能落在另一個 pane。若 `state.json` 留著一個指向已消失 pane 的 `session_id → pane_id`，後續回報會得到 `pane_not_found`；bridge 刻意吞掉 herdr 的失敗（不阻塞 turn），於是這個 session 的所有事件都會靜默消失，而且**永不自行恢復**——因為快取命中後從不驗證、也沒有任何重新探測的機會。
+
+對策有兩道，刻意都收斂在低成本的位置：
+
+- **`SessionEnd` 連帶清除快取項**。釋放 pane 的同時把 `panes[sessionId]` 從 `state.json` 移除，讓映射不會比它指向的 pane 活得久。
+- **只有 `SessionStart` 重新探測**。這是唯一「session 可能已經換了 pane」的時刻——被還原的 session 正是靠 `SessionStart` 帶著同一個 `session_id` 在新 pane 重新上線。新探測結果會覆寫快取；若探測歧義或無結果（無法證明快取是錯的），則保留快取不動。
+
+其餘事件不做驗證：session 存活期間 process 不會搬家，每個事件重新探測只會換來同樣的答案，代價是每個 `PreToolUse` / `PostToolUse` 都多一次 round-trip。`SessionStart` 探測無定論時「寧可保留舊值」也是刻意的——丟掉一個多半仍然正確的映射，比留著一個可能錯的更糟。
 
 ### 已知限制
 
@@ -166,6 +177,7 @@ herdr 在受管 pane 中注入（見 [herdr add-herdr-support docs](https://herd
   - `--seq` 計數器單調遞增 + 持久化往返 + 損壞 state.json 容錯 + 首次以 timestamp 起算
   - `state.json` 原子寫入（不留下 `.tmp` 殘留檔）
   - Pane 反查：cwd 唯一匹配、歧義 no-op、子目錄 fallback、不搶他人持有的 pane、`session_id` 快取不重複探測、未映射事件不探測
+  - 快取失效與自癒：`SessionEnd` 清除快取項、被還原的 session 在 `SessionStart` 重新解析到新 pane、探測無定論時保留快取、存活 session 不因 pane 列表變動被重新指向
   - `HERDR_PANE_ID` 快路徑優先於反查
   - stdin 損壞 / 空 / 非 JSON 時 graceful exit
 

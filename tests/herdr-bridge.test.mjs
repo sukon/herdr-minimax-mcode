@@ -132,6 +132,20 @@ function paneListOf(panes) {
   return { id: 'cli:pane:list', result: { panes, type: 'pane_list' } };
 }
 
+function statePath(ticketDir) {
+  return join(ticketDir, 'state.json');
+}
+
+function readState(ticketDir) {
+  return JSON.parse(readFileSync(statePath(ticketDir), 'utf8'));
+}
+
+// Pre-seed the persisted state so a test can start from a bridge that already
+// ran once — for instance one holding a pane id that has since been recycled.
+function seedState(ticketDir, state) {
+  writeFileSync(statePath(ticketDir), JSON.stringify(state), 'utf8');
+}
+
 const NO_HERDR_ENV = { HERDR_ENV: '', HERDR_PANE_ID: '' };
 
 const SESSION_START_PAYLOAD = JSON.stringify({
@@ -760,4 +774,108 @@ test('SessionEnd releases the cached pane', () => {
     paneList: panes,
   });
   assert.deepEqual(argv.slice(0, 3), ['pane', 'release-agent', 'w4:p1']);
+});
+
+test('SessionEnd drops the session from the pane cache', () => {
+  const ticket = mkdtempSync(join(tmpdir(), 'herdr-bridge-'));
+  const panes = paneListOf([{ pane_id: 'w5:p1', cwd: '/work/proj' }]);
+  run({
+    env: { ...NO_HERDR_ENV, PLUGIN_DATA: ticket },
+    stdin: JSON.stringify({
+      hook_event_name: 'SessionStart',
+      session_id: 's1',
+      source: 'startup',
+      cwd: '/work/proj',
+    }),
+    ticketDir: ticket,
+    paneList: panes,
+  });
+  assert.equal(readState(ticket).panes.s1, 'w5:p1');
+  const { stateJson } = run({
+    env: { ...NO_HERDR_ENV, PLUGIN_DATA: ticket },
+    stdin: JSON.stringify({
+      hook_event_name: 'SessionEnd',
+      session_id: 's1',
+      reason: 'logout',
+      cwd: '/work/proj',
+    }),
+    ticketDir: ticket,
+    paneList: panes,
+  });
+  // The pane id is Herdr's to recycle once released, so the mapping has to go
+  // with it rather than outliving the pane it points at.
+  assert.equal(stateJson.panes.s1, undefined);
+  assert.deepEqual(stateJson.panes, {});
+});
+
+test('a session resumed into a new pane re-resolves instead of trusting the cache', () => {
+  const ticket = mkdtempSync(join(tmpdir(), 'herdr-bridge-'));
+  // A mapping left over from a previous run, pointing at a pane that no longer
+  // exists — exactly what a restore into a recycled pane id looks like.
+  seedState(ticket, { seq: 1000, panes: { s1: 'w9:p9' } });
+  const { argv, stateJson } = run({
+    env: { ...NO_HERDR_ENV, PLUGIN_DATA: ticket },
+    stdin: JSON.stringify({
+      hook_event_name: 'SessionStart',
+      session_id: 's1',
+      source: 'startup',
+      cwd: '/work/proj',
+    }),
+    ticketDir: ticket,
+    paneList: paneListOf([{ pane_id: 'w7:p3', cwd: '/work/proj' }]),
+  });
+  assert.equal(argv[2], 'w7:p3');
+  assert.equal(stateJson.panes.s1, 'w7:p3');
+  // Still monotonic across the seeded state, so Herdr does not drop the report.
+  assert.ok(stateJson.seq > 1000);
+});
+
+test('an inconclusive re-probe keeps the cached pane', () => {
+  const ticket = mkdtempSync(join(tmpdir(), 'herdr-bridge-'));
+  seedState(ticket, { seq: 1000, panes: { s1: 'w9:p9' } });
+  // Two panes share the cwd, so the probe cannot pick one and proves nothing.
+  const { argv, probeCount } = run({
+    env: { ...NO_HERDR_ENV, PLUGIN_DATA: ticket },
+    stdin: JSON.stringify({
+      hook_event_name: 'SessionStart',
+      session_id: 's1',
+      source: 'startup',
+      cwd: '/work/proj',
+    }),
+    ticketDir: ticket,
+    paneList: paneListOf([
+      { pane_id: 'w7:p3', cwd: '/work/proj' },
+      { pane_id: 'w8:p1', cwd: '/work/proj' },
+    ]),
+  });
+  assert.equal(argv[2], 'w9:p9');
+  assert.equal(probeCount, 1);
+});
+
+test('only SessionStart re-probes, so a live session keeps its cached pane', () => {
+  const ticket = mkdtempSync(join(tmpdir(), 'herdr-bridge-'));
+  const payload = (event) => JSON.stringify({
+    hook_event_name: event,
+    session_id: 's1',
+    cwd: '/work/proj',
+    ...(event === 'SessionStart' ? { source: 'startup' } : {}),
+  });
+  run({
+    env: { ...NO_HERDR_ENV, PLUGIN_DATA: ticket },
+    stdin: payload('SessionStart'),
+    ticketDir: ticket,
+    paneList: paneListOf([{ pane_id: 'w6:p1', cwd: '/work/proj' }]),
+  });
+  // The pane has since moved on the list; a live session must not be re-pointed.
+  const later = run({
+    env: { ...NO_HERDR_ENV, PLUGIN_DATA: ticket },
+    stdin: payload('PostToolUse'),
+    ticketDir: ticket,
+    paneList: paneListOf([
+      { pane_id: 'w6:p1', cwd: '/work/proj' },
+      { pane_id: 'w6:p2', cwd: '/work/proj' },
+    ]),
+  });
+  assert.equal(later.argv[2], 'w6:p1');
+  assert.equal(later.probeCount, 1);
 });
