@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/MiniMax-AI/minimax-code/main/packages/local-runtime-v2/src/service/plugin-system/plugin/package/types.ts",
+  "schemaVersion": 1,
+  "name": "herdr-bridge",
+  "displayName": "Herdr Bridge",
+  "version": "0.1.0",
+  "description": "Reports MiniMax Code (MCode) lifecycle state and session id to Herdr, so MCode behaves as a first-class agent inside Herdr panes. After a Herdr server restart the same Session is reopened with `mcode --resume <id>`.",
+  "author": "sukon",
+  "icon": "assets/icon.png",
+  "category": "Code",
+  "exampleQueries": [
+    "use MCode inside Herdr with sidebar status and native session restore"
+  ],
+  "apps": [],
+  "mcpServers": [],
+  "skills": [],
+  "hooks": [
+    "hooks/all-hooks.json"
+  ],
+  "hostBindings": []
+}
