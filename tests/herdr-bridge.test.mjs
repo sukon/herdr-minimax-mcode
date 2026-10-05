@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, statSync, readdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, statSync, readdirSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
@@ -18,14 +18,29 @@ const SCRIPT = join(REPO_ROOT, 'herdr-bridge', 'scripts', 'herdr-bridge.mjs');
 
 // The bridge spawns herdr as an unref'd child so the script itself can exit
 // quickly. Tests therefore poll briefly for the log file to settle.
+//
+// The wait is a sleep, not a spin: `while (Date.now() < until) {}` pinned the
+// core at 100% and made the suite look hung. Atomics.wait parks this thread
+// without burning CPU, and the fake herdr still makes progress because it is a
+// separate OS process.
+//
+// Known limitation: Atomics.wait still blocks the event loop, so node's
+// --test-timeout cannot interrupt a wedged run. Only the idle CPU cost went
+// away. Making the timeout effective needs an async waitForLog, which would
+// force run() and all callers to become async.
+const SLEEP_SLOT = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSync(ms) {
+  Atomics.wait(SLEEP_SLOT, 0, 0, ms);
+}
+
 function waitForLog(logPath, timeoutMs = 4000) {
   const deadline = Date.now() + timeoutMs;
   let lastSize = -1;
   let stableSince = 0;
   while (Date.now() < deadline) {
     if (!existsSync(logPath)) {
-      const until = Date.now() + 50;
-      while (Date.now() < until) { /* spin briefly */ }
+      sleepSync(50);
       continue;
     }
     const size = statSync(logPath).size;
@@ -36,8 +51,7 @@ function waitForLog(logPath, timeoutMs = 4000) {
       lastSize = size;
       stableSince = 0;
     }
-    const until = Date.now() + 50;
-    while (Date.now() < until) { /* spin briefly */ }
+    sleepSync(50);
   }
   return existsSync(logPath) ? readFileSync(logPath, 'utf8') : '';
 }
@@ -47,7 +61,8 @@ function makeFakeHerdr(ticketDir, { paneList = null } = {}) {
   // on Windows and POSIX. It records every argv element (one per line) into
   // args.log inside the ticket directory.
   const logPath = join(ticketDir, 'args.log');
-  const wrapperPath = join(ticketDir, 'fake-herdr.cmd');
+  const isWindows = process.platform === 'win32';
+  const wrapperPath = join(ticketDir, isWindows ? 'fake-herdr.cmd' : 'fake-herdr.sh');
   const scriptPath = join(ticketDir, 'fake-herdr.mjs');
   const paneListJson = paneList === null ? null : JSON.stringify(paneList);
   writeFileSync(
@@ -74,10 +89,22 @@ if (lines[0] === 'pane' && lines[1] === 'list') {
 writeFileSync(target, lines.join('\\n') + (lines.length ? '\\n' : ''));
 `,
   );
-  writeFileSync(
-    wrapperPath,
-    `@echo off\r\nnode "${scriptPath}" --log "${logPath}" %*\r\nexit /b 0\r\n`,
-  );
+  // Windows gets a .cmd wrapper because the bridge runs it through cmd.exe.
+  // POSIX gets a chmod +x /bin/sh wrapper, because there the bridge execs
+  // HERDR_BIN_PATH directly with shell:false — a .cmd is neither executable
+  // nor has a shebang, so it fails with EACCES there.
+  if (isWindows) {
+    writeFileSync(
+      wrapperPath,
+      `@echo off\r\nnode "${scriptPath}" --log "${logPath}" %*\r\nexit /b 0\r\n`,
+    );
+  } else {
+    writeFileSync(
+      wrapperPath,
+      `#!/bin/sh\nexec "${process.execPath}" "${scriptPath}" --log "${logPath}" "$@"\n`,
+    );
+    chmodSync(wrapperPath, 0o755);
+  }
   return { scriptPath: wrapperPath, logPath, probesLog: join(ticketDir, 'probes.log') };
 }
 
