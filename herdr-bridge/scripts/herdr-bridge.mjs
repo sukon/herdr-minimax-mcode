@@ -50,6 +50,15 @@ const WINDOWS_ENV_ALLOWLIST = [
   'LOCALAPPDATA',
 ];
 
+// Herdr locates its socket under the user's config dir, so a POSIX child needs
+// HOME (or an explicit XDG_CONFIG_HOME) or it probes a temp path instead and
+// comes back `server_not_running`. Both are non-secret and both are already
+// present in the hook process's own environment.
+const POSIX_ENV_ALLOWLIST = [
+  'HOME',
+  'XDG_CONFIG_HOME',
+];
+
 const HERDR_STATE_FOR_EVENT = {
   SessionStart: 'idle',
   UserPromptSubmit: 'working',
@@ -143,11 +152,22 @@ function persistSequenceState(env, seq, panes) {
 }
 
 function herdrChildEnv() {
+  // HOME and XDG_CONFIG_HOME are not optional here: Herdr resolves its socket
+  // from the user's config dir, and without them it falls back to a temp path,
+  // reports `server_not_running` against a socket that was never ours, and the
+  // pane reverse-lookup silently finds nothing. MCode already hands the hook
+  // process HOME (it is on the hook env allowlist), so passing it through to the
+  // Herdr CLI leaks nothing new — and it is not a secret.
   const env = { PATH: process.env.PATH ?? '' };
-  if (process.platform !== 'win32') return env;
-  for (const key of WINDOWS_ENV_ALLOWLIST) {
+  for (const key of POSIX_ENV_ALLOWLIST) {
     const value = process.env[key];
     if (typeof value === 'string' && value.length > 0) env[key] = value;
+  }
+  if (process.platform === 'win32') {
+    for (const key of WINDOWS_ENV_ALLOWLIST) {
+      const value = process.env[key];
+      if (typeof value === 'string' && value.length > 0) env[key] = value;
+    }
   }
   return env;
 }
@@ -355,6 +375,11 @@ function listPanes(herdrBin, childEnv) {
   if (!stdout) return undefined;
   try {
     const parsed = JSON.parse(stdout);
+    // The CLI exits 0 even when it answers with an error envelope, so the
+    // `status !== 0` check in herdrCapture never catches this. Without an
+    // explicit look, `server_not_running` (wrong socket path, for instance)
+    // reads as "the server has no panes" and the whole session stays mute.
+    if (parsed && typeof parsed === 'object' && parsed.error) return undefined;
     const panes = parsed?.result?.panes;
     return Array.isArray(panes) ? panes : undefined;
   } catch {
